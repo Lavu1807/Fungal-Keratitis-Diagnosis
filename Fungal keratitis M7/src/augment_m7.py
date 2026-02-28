@@ -1,0 +1,135 @@
+"""
+Data Augmentation for Model M7 (Illumination Eq + Adaptive CLAHE + Normalization + MA Extraction)
+==================================================================================================
+Augmentation Strategy:
+  - Horizontal flip, Vertical flip
+  - Random rotation (±15°) — conservative to preserve MA extraction features
+  - Random crop (90-95% of image, resized back) — conservative
+  - NO Gaussian blur (MA features are delicate structures)
+  - Extra augmentations on minority class (normal) to balance with FK
+
+Input:  data/processed/FK/ and data/processed/normal/
+Output: data/augmented/FK/ and data/augmented/normal/
+"""
+
+import os
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+# ── Model-specific augmentation parameters ──────────────────────
+ROTATION_RANGE = (-15, 15)        # Conservative for MA structures
+CROP_FACTOR_RANGE = (0.90, 0.95)  # Conservative to preserve MA features
+GAUSSIAN_BLUR_KERNEL = 0          # Disabled — MA features are delicate
+RANDOM_SEED = 42
+
+# ── Paths ────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
+AUGMENTED_DIR = os.path.join(BASE_DIR, "data", "augmented")
+
+
+def random_rotation(img, rng):
+    angle = rng.uniform(*ROTATION_RANGE)
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+
+
+def random_crop(img, rng):
+    h, w = img.shape[:2]
+    factor = rng.uniform(*CROP_FACTOR_RANGE)
+    new_h, new_w = int(h * factor), int(w * factor)
+    top = rng.integers(0, h - new_h + 1)
+    left = rng.integers(0, w - new_w + 1)
+    cropped = img[top:top + new_h, left:left + new_w]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def generate_augmentations(img, rng, count):
+    augmented = []
+    transforms = [
+        lambda im: cv2.flip(im, 1),
+        lambda im: cv2.flip(im, 0),
+        lambda im: random_rotation(im, rng),
+        lambda im: random_crop(im, rng),
+        lambda im: cv2.flip(random_rotation(im, rng), 1),
+        lambda im: random_crop(random_rotation(im, rng), rng),
+        lambda im: cv2.flip(im, -1),
+        lambda im: cv2.flip(random_crop(im, rng), 0),
+        lambda im: random_rotation(random_crop(im, rng), rng),
+        lambda im: cv2.flip(random_rotation(im, rng), -1),
+    ]
+    for i in range(count):
+        t = transforms[i % len(transforms)]
+        augmented.append(t(img.copy()))
+    return augmented
+
+
+def augment_class(class_name, target_total, rng):
+    src_dir = os.path.join(PROCESSED_DIR, class_name)
+    dst_dir = os.path.join(AUGMENTED_DIR, class_name)
+    os.makedirs(dst_dir, exist_ok=True)
+
+    filenames = sorted([f for f in os.listdir(src_dir)
+                        if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))])
+    n_originals = len(filenames)
+    if n_originals == 0:
+        print(f"  WARNING: No images found in {src_dir}")
+        return 0
+
+    n_augmented_needed = max(0, target_total - n_originals)
+    aug_per_image = n_augmented_needed // n_originals
+    extra = n_augmented_needed % n_originals
+
+    saved = 0
+    print(f"  {class_name}: {n_originals} originals → target {target_total} "
+          f"(+{n_augmented_needed} augmented)")
+
+    for idx, fname in enumerate(tqdm(filenames, desc=f"  Augmenting {class_name}")):
+        img = cv2.imread(os.path.join(src_dir, fname), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            continue
+
+        base, ext = os.path.splitext(fname)
+        cv2.imwrite(os.path.join(dst_dir, fname), img)
+        saved += 1
+
+        n_aug = aug_per_image + (1 if idx < extra else 0)
+        if n_aug > 0:
+            augs = generate_augmentations(img, rng, n_aug)
+            for j, aug_img in enumerate(augs):
+                cv2.imwrite(os.path.join(dst_dir, f"{base}_aug{j}{ext}"), aug_img)
+                saved += 1
+
+    return saved
+
+
+def main():
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    fk_files = [f for f in os.listdir(os.path.join(PROCESSED_DIR, "FK"))
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))]
+    normal_files = [f for f in os.listdir(os.path.join(PROCESSED_DIR, "normal"))
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'))]
+
+    n_fk, n_normal = len(fk_files), len(normal_files)
+
+    print(f"Model M7 — Data Augmentation")
+    print(f"{'=' * 50}")
+    print(f"Original counts: FK={n_fk}, Normal={n_normal}")
+    print(f"Params: rotation={ROTATION_RANGE}, crop={CROP_FACTOR_RANGE}, blur=disabled")
+
+    fk_target = n_fk * 3
+    normal_target = fk_target
+    print(f"Targets: FK={fk_target}, Normal={normal_target}\n")
+
+    fk_saved = augment_class("FK", fk_target, rng)
+    normal_saved = augment_class("normal", normal_target, rng)
+
+    print(f"\nDone! FK: {fk_saved} images, Normal: {normal_saved} images")
+    print(f"Saved to: {AUGMENTED_DIR}")
+
+
+if __name__ == "__main__":
+    main()
